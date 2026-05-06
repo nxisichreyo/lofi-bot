@@ -5,14 +5,29 @@ const {
   createAudioResource,
   AudioPlayerStatus,
   NoSubscriberBehavior,
-  StreamType
+  StreamType,
+  entersState,
+  VoiceConnectionStatus
 } = require("@discordjs/voice");
 
-const prism = require("prism-media");
 const ffmpegPath = require("ffmpeg-static");
 const { spawn } = require("child_process");
 const express = require("express");
 
+// ================== CONFIG ==================
+const TOKEN = process.env.TOKEN;
+
+// Reliable stations
+const STATIONS = {
+  lofi: "https://stream.zeno.fm/f3wvbbqmdg8uv",
+  chill: "https://stream.zeno.fm/8wv4q2kmdg8uv",
+  jazz: "https://stream.zeno.fm/0r0xa792kwzuv"
+};
+
+let currentStation = "lofi";
+let volume = 0.5;
+
+// ================== DISCORD ==================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -22,12 +37,12 @@ const client = new Client({
   ]
 });
 
-const app = express();
-app.use(express.json());
+let connection = null;
+let player = null;
 
-// 🌐 WEB DASHBOARD (basic)
-let currentStation = "lofi";
-let volume = 0.5;
+// ================== WEB DASHBOARD ==================
+const app = express();
+app.use(express.urlencoded({ extended: true }));
 
 app.get("/", (req, res) => {
   res.send(`
@@ -47,38 +62,33 @@ app.get("/", (req, res) => {
   `);
 });
 
-app.post("/station", express.urlencoded({ extended: true }), (req, res) => {
-  currentStation = req.body.station;
-  restartStream();
+app.post("/station", (req, res) => {
+  if (STATIONS[req.body.station]) {
+    currentStation = req.body.station;
+    restartStream();
+  }
   res.redirect("/");
 });
 
-app.post("/volume", express.urlencoded({ extended: true }), (req, res) => {
-  volume = Math.max(0, Math.min(1, parseFloat(req.body.volume)));
-  restartStream();
+app.post("/volume", (req, res) => {
+  const v = parseFloat(req.body.volume);
+  if (!isNaN(v)) {
+    volume = Math.max(0, Math.min(1, v));
+    restartStream();
+  }
   res.redirect("/");
 });
 
-// Railway port
 app.listen(process.env.PORT || 3000, () => {
   console.log("Web dashboard running");
 });
 
-// 🎧 Stations
-const STATIONS = {
-  lofi: "https://stream.zeno.fm/f3wvbbqmdg8uv",
-  chill: "https://stream.zeno.fm/8wv4q2kmdg8uv",
-  jazz: "https://stream.zeno.fm/0r0xa792kwzuv"
-};
-
-let connection;
-let player;
-
-client.on("ready", () => {
+// ================== BOT READY ==================
+client.on("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}`);
 });
 
-// 🎮 Commands
+// ================== COMMANDS ==================
 client.on("messageCreate", async (msg) => {
   if (msg.content === "!join") {
     if (!msg.member.voice.channel)
@@ -90,13 +100,25 @@ client.on("messageCreate", async (msg) => {
       adapterCreator: msg.guild.voiceAdapterCreator
     });
 
-    startStream();
-    msg.reply("🎧 Lofi started");
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 10000);
+      startStream();
+      msg.reply("🎧 Streaming started");
+    } catch (err) {
+      console.error("Connection failed:", err);
+      msg.reply("❌ Failed to join VC");
+    }
+  }
+
+  if (msg.content === "!leave") {
+    connection?.destroy();
+    connection = null;
+    msg.reply("👋 Left VC");
   }
 
   if (msg.content.startsWith("!volume")) {
     const v = parseFloat(msg.content.split(" ")[1]);
-    if (isNaN(v)) return msg.reply("Give number 0–1");
+    if (isNaN(v)) return msg.reply("Use 0–1");
 
     volume = Math.max(0, Math.min(1, v));
     restartStream();
@@ -111,16 +133,15 @@ client.on("messageCreate", async (msg) => {
     restartStream();
     msg.reply(`📻 Switched to ${s}`);
   }
-
-  if (msg.content === "!leave") {
-    connection?.destroy();
-    msg.reply("👋 Left VC");
-  }
 });
 
-// 🔁 Start stream (FIXED)
+// ================== STREAM LOGIC ==================
 function startStream() {
   if (!connection) return;
+
+  if (player) {
+    try { player.stop(); } catch {}
+  }
 
   player = createAudioPlayer({
     behaviors: {
@@ -128,18 +149,31 @@ function startStream() {
     }
   });
 
-  const stream = spawn(ffmpegPath, [
+  const url = STATIONS[currentStation];
+  console.log("Starting stream:", url);
+
+  const ffmpeg = spawn(ffmpegPath, [
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
-    "-i", STATIONS[currentStation],
+    "-loglevel", "error",
+    "-i", url,
+    "-vn",
     "-f", "s16le",
     "-ar", "48000",
     "-ac", "2",
     "pipe:1"
   ]);
 
-  const resource = createAudioResource(stream.stdout, {
+  ffmpeg.on("error", (err) => {
+    console.error("FFmpeg error:", err);
+  });
+
+  ffmpeg.stderr.on("data", (data) => {
+    console.log("FFmpeg:", data.toString());
+  });
+
+  const resource = createAudioResource(ffmpeg.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true
   });
@@ -149,20 +183,30 @@ function startStream() {
   player.play(resource);
   connection.subscribe(player);
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    console.log("Restarting...");
-    startStream();
-  });
+  let restarting = false;
 
-  stream.stderr.on("data", () => {}); // silence ffmpeg spam
+  player.on(AudioPlayerStatus.Idle, () => {
+    if (restarting) return;
+
+    restarting = true;
+    console.log("Stream stopped. Restarting in 5s...");
+
+    setTimeout(() => {
+      restarting = false;
+      startStream();
+    }, 5000);
+  });
 }
 
-// 🔄 Restart helper
+// ================== RESTART ==================
 function restartStream() {
   try {
     player?.stop();
     startStream();
-  } catch {}
+  } catch (e) {
+    console.error(e);
+  }
 }
 
-client.login(process.env.TOKEN);
+// ================== LOGIN ==================
+client.login(TOKEN);
